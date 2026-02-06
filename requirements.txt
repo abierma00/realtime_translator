@@ -3,6 +3,4 @@ openai-whisper
 deep-translator
 imageio-ffmpeg
 gTTS
-streamlit-webrtc
-pydub
-av
+streamlit-mic-recorder

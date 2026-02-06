@@ -1,136 +1,126 @@
 import streamlit as st
 import whisper
-import av
 import os
-import time
 import tempfile
-import pydub
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
 from deep_translator import GoogleTranslator
 from gtts import gTTS
+from streamlit_mic_recorder import mic_recorder
 
 # --- PAGE SETUP ---
-st.set_page_config(page_title="Real-Time Interpreter", layout="wide")
+st.set_page_config(page_title="Classroom Interpreter", layout="wide")
 
-# --- SESSION STATE ---
-# We use this to store audio while the app is running
-if "audio_buffer" not in st.session_state:
-    st.session_state.audio_buffer = pydub.AudioSegment.empty()
-if "last_process_time" not in st.session_state:
-    st.session_state.last_process_time = time.time()
-if "transcript_history" not in st.session_state:
-    st.session_state.transcript_history = []
+# --- HELPER: GET LANGUAGE CODES ---
+# This fixes the error. We get a dictionary like {'arabic': 'ar', 'spanish': 'es'}
+try:
+    LANG_CODES = GoogleTranslator().get_supported_languages(as_dict=True)
+except:
+    # Backup in case internet fails momentarily
+    LANG_CODES = {"english": "en", "spanish": "es", "french": "fr", "german": "de", "arabic": "ar"}
 
-# --- LOAD MODELS ---
-# Use @st.cache_resource so we only load the model once (saves speed)
-@st.cache_resource
-def load_whisper():
-    return whisper.load_model("tiny") # 'tiny' is essential for real-time speed
-
-model = load_whisper()
-
-# --- AUDIO CALLBACK (The "Ear") ---
-# This function runs in the background and grabs audio chunks from the browser
-def process_audio(frame: av.AudioFrame):
-    sound = pydub.AudioSegment(
-        data=frame.to_ndarray().tobytes(),
-        sample_width=frame.format.bytes,
-        frame_rate=frame.sample_rate,
-        channels=len(frame.layout.channels)
-    )
-    # Add new sound to our buffer
-    st.session_state.audio_buffer += sound
-
-# --- MAIN APP ---
 def main():
-    st.title("⚡ Real-Time Classroom Interpreter")
-    st.markdown("This app listens continuously. **Click Start** and it will translate every few seconds.")
+    st.title("👨‍🏫 Classroom Live Interpreter")
+    st.markdown("### Step 1: Select Your Language")
 
-    # 1. Settings
+    # --- 1. Settings ---
     col1, col2 = st.columns(2)
     with col1:
+        # Teacher's side (Source)
         st.info("Teacher is speaking: **English**")
+        
     with col2:
-        # Target Language
-        try:
-            langs = GoogleTranslator().get_supported_languages()
-            target_lang = st.selectbox("Translate to:", [l.capitalize() for l in langs], index=langs.index("spanish"))
-        except:
-            target_lang = "Spanish"
+        # Student's side (Target)
+        # We create a list of nice names (Capitalized) for the dropdown
+        display_names = [name.capitalize() for name in LANG_CODES.keys()]
+        
+        # Default to Spanish if available
+        default_index = display_names.index("Spanish") if "Spanish" in display_names else 0
+        
+        target_lang_name = st.selectbox(
+            "I want to hear:",
+            display_names,
+            index=default_index
+        )
+        
+        # KEY FIX: Get the 2-letter code (e.g., 'ar') for the selected name
+        target_lang_code = LANG_CODES.get(target_lang_name.lower(), "en")
 
     st.divider()
 
-    # 2. The "Live" Connection
-    # This creates the continuous WebRTC connection
-    ctx = webrtc_streamer(
-        key="live-interpreter",
-        mode=WebRtcMode.SENDONLY,
-        audio_frame_callback=process_audio,
-        media_stream_constraints={"video": False, "audio": True},
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    # --- 2. The Listener ---
+    st.markdown("### Step 2: Listen to Teacher")
+    st.info(
+        "**Instructions:**\n"
+        "1. In Zoom, set Speaker to **'CABLE Input'** (or BlackHole).\n"
+        "2. Click Start below, then select **'CABLE Output'** as the microphone."
     )
 
-    # 3. The Processing Loop
-    # If the streamer is active (Green light), run this loop
-    status_placeholder = st.empty()
-    output_placeholder = st.empty()
+    # The Recording Component
+    audio_data = mic_recorder(
+        start_prompt="🔴 Start Listening",
+        stop_prompt="⏹️ Stop & Translate",
+        key="recorder",
+        format="wav",
+        use_container_width=True
+    )
 
-    while ctx.state.playing:
-        status_placeholder.markdown("🔴 **Listening...** (Do not close this tab)")
+    # --- 3. Processing & Output ---
+    if audio_data is not None:
+        st.divider()
+        audio_bytes = audio_data['bytes']
         
-        # Check if 5 seconds have passed
-        now = time.time()
-        if now - st.session_state.last_process_time > 5:
-            
-            # Grab the audio buffer
-            audio_chunk = st.session_state.audio_buffer
-            
-            # Only process if we have audio
-            if len(audio_chunk) > 0:
-                # Reset buffer and timer immediately (so we don't miss new words)
-                st.session_state.audio_buffer = pydub.AudioSegment.empty()
-                st.session_state.last_process_time = now
+        # Save to temp file for Whisper
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+            tmp_file.write(audio_bytes)
+            tmp_path = tmp_file.name
+
+        try:
+            # A. Transcribe (English)
+            with st.spinner("🎧 Transcribing teacher's voice..."):
+                # Use 'tiny' for speed
+                model = whisper.load_model("tiny")
+                result = model.transcribe(tmp_path)
+                original_text = result["text"]
+
+            if original_text.strip():
+                # B. Translate
+                with st.spinner("🌍 Translating..."):
+                    # Use the "key fix" code from above
+                    translator = GoogleTranslator(source='auto', target=target_lang_code)
+                    translated_text = translator.translate(original_text)
+
+                # C. Display & Speak
+                col_orig, col_trans = st.columns(2)
                 
-                # Save to temp file for Whisper
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                    audio_chunk.export(tmp_file.name, format="wav")
-                    tmp_path = tmp_file.name
+                with col_orig:
+                    st.markdown("**Teacher Said (English):**")
+                    st.caption(original_text)
                 
-                try:
-                    # A. Transcribe
-                    result = model.transcribe(tmp_path)
-                    text = result["text"].strip()
+                with col_trans:
+                    st.markdown(f"**Translation ({target_lang_name}):**")
+                    st.success(translated_text)
                     
-                    if len(text) > 1: # Ignore silence/noise
-                        # B. Translate
-                        translator = GoogleTranslator(source='auto', target=target_lang.lower())
-                        trans_text = translator.translate(text)
+                    # Generate Audio
+                    try:
+                        # KEY FIX: Use the 2-letter code (e.g., 'ar') here
+                        tts = gTTS(text=translated_text, lang=target_lang_code)
                         
-                        # C. Add to history
-                        st.session_state.transcript_history.append((text, trans_text))
-                        
-                        # D. Speak (Autoplay)
-                        tts = gTTS(text=trans_text, lang=target_lang.lower())
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-                            tts.save(fp.name)
-                            st.audio(fp.name, format="audio/mp3", start_time=0)
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as audio_fp:
+                            tts.save(audio_fp.name)
+                            # Auto-play the translation
+                            st.audio(audio_fp.name, format="audio/mp3", start_time=0)
+                    except Exception as e:
+                        st.error(f"Audio error: {e}")
 
-                except Exception as e:
-                    print(f"Error: {e}")
-                
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+            else:
+                st.warning("⚠️ No sound detected. Did you select 'CABLE Output'?")
 
-        # Display History (Reverse order so newest is on top)
-        with output_placeholder.container():
-            for original, translated in reversed(st.session_state.transcript_history[-5:]):
-                st.markdown(f"**Teacher:** {original}")
-                st.success(f"**{target_lang}:** {translated}")
-                st.divider()
+        except Exception as e:
+            st.error(f"Error: {e}")
         
-        # Sleep briefly to save CPU
-        time.sleep(0.5)
+        finally:
+            # Cleanup
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 if __name__ == "__main__":
     main()

@@ -6,3 +6,4 @@ gTTS
 streamlit-webrtc
 pydub
 av
+pyaudioop
